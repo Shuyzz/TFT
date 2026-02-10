@@ -6,6 +6,9 @@ from glob import glob
 DB_PATH = "data/tft.db"
 RAW_DIR = "data/raw_matches"
 
+# Set True if you want to rebuild from scratch each time
+WIPE_DB = False
+
 def create_tables(conn: sqlite3.Connection):
     cur = conn.cursor()
 
@@ -30,6 +33,7 @@ def create_tables(conn: sqlite3.Connection):
     )
     """)
 
+    # Item-level rows (kept for simple counts / joins)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS unit_item (
         match_id TEXT,
@@ -40,12 +44,48 @@ def create_tables(conn: sqlite3.Connection):
     )
     """)
 
-    # Helpful indexes for speed later
+    # NEW: One row per unit appearance, with the full item loadout encoded.
+    # items_key is sorted and preserves duplicates:
+    #   ""  (no items)
+    #   "TFT_Item_GargoyleStoneplate"
+    #   "TFT_Item_GargoyleStoneplate|TFT_Item_WarmogsArmor"
+    #   "TFT_Item_GargoyleStoneplate|TFT_Item_GargoyleStoneplate|TFT_Item_WarmogsArmor"
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS unit_loadout (
+        match_id TEXT,
+        puuid TEXT,
+        champion_id TEXT,
+        unit_tier INTEGER,
+        items_key TEXT,
+        PRIMARY KEY (match_id, puuid, champion_id, unit_tier, items_key)
+    )
+    """)
+
+    # Helpful indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_unit_item_champ ON unit_item(champion_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_unit_item_item  ON unit_item(item_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_player_match_place ON player_match(placement)")
 
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_loadout_champ ON unit_loadout(champion_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_loadout_items ON unit_loadout(items_key)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_patch ON matches(patch_bucket)")
+
     conn.commit()
+
+def wipe_tables(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM unit_item")
+    cur.execute("DELETE FROM unit_loadout")
+    cur.execute("DELETE FROM player_match")
+    cur.execute("DELETE FROM matches")
+    conn.commit()
+
+def make_items_key(items):
+    """Return canonical items_key string. Sorted, duplicates preserved."""
+    if not items:
+        return ""
+    items_sorted = sorted(items)
+    return "|".join(items_sorted)
 
 def ingest_one_match(conn: sqlite3.Connection, match: dict):
     cur = conn.cursor()
@@ -56,10 +96,9 @@ def ingest_one_match(conn: sqlite3.Connection, match: dict):
     game_version = info.get("game_version")
     tft_set_number = info.get("tft_set_number")
 
-    # patch bucket: from derived if present, else NULL
     patch_bucket = None
-    if "_derived" in match and "patch_bucket" in match["_derived"]:
-        patch_bucket = match["_derived"]["patch_bucket"]
+    if "_derived" in match and isinstance(match["_derived"], dict):
+        patch_bucket = match["_derived"].get("patch_bucket")
 
     # Insert match row
     cur.execute("""
@@ -67,8 +106,8 @@ def ingest_one_match(conn: sqlite3.Connection, match: dict):
     VALUES (?, ?, ?, ?, ?)
     """, (match_id, game_datetime, patch_bucket, game_version, tft_set_number))
 
-    # Insert participants + unit items
-    for p in info["participants"]:
+    # Insert participants + units
+    for p in info.get("participants", []):
         puuid = p["puuid"]
         placement = p.get("placement")
         riot_name = p.get("riotIdGameName")
@@ -79,11 +118,20 @@ def ingest_one_match(conn: sqlite3.Connection, match: dict):
         VALUES (?, ?, ?, ?, ?)
         """, (match_id, puuid, placement, riot_name, riot_tag))
 
-        # Units and their items
-        for u in p.get("units", []):
+        for u in p.get("units", []) or []:
             champ = u.get("character_id")
             tier = u.get("tier")
+
             items = u.get("itemNames", []) or []
+            # Always write the loadout row (even if items == [])
+            items_key = make_items_key(items)
+
+            cur.execute("""
+            INSERT OR IGNORE INTO unit_loadout(match_id, puuid, champion_id, unit_tier, items_key)
+            VALUES (?, ?, ?, ?, ?)
+            """, (match_id, puuid, champ, tier, items_key))
+
+            # Also write item-level rows (one row per item)
             for item_name in items:
                 cur.execute("""
                 INSERT INTO unit_item(match_id, puuid, champion_id, unit_tier, item_name)
@@ -102,6 +150,9 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     create_tables(conn)
 
+    if WIPE_DB:
+        wipe_tables(conn)
+
     ingested = 0
     for fp in json_files:
         with open(fp, "r", encoding="utf-8") as f:
@@ -114,6 +165,7 @@ def main():
 
     # Quick sanity checks:
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) FROM matches")
     print("matches rows:", cur.fetchone()[0])
 
@@ -122,6 +174,24 @@ def main():
 
     cur.execute("SELECT COUNT(*) FROM unit_item")
     print("unit_item rows:", cur.fetchone()[0])
+
+    cur.execute("SELECT COUNT(*) FROM unit_loadout")
+    print("unit_loadout rows:", cur.fetchone()[0])
+
+    cur.execute("SELECT COUNT(*) FROM unit_loadout WHERE items_key = ''")
+    print("unit_loadout rows with NO items (items_key=''):", cur.fetchone()[0])
+
+    # Optional peek: show a few loadouts
+    cur.execute("""
+    SELECT champion_id, items_key, COUNT(*) as n
+    FROM unit_loadout
+    GROUP BY champion_id, items_key
+    ORDER BY n DESC
+    LIMIT 10
+    """)
+    print("\nTop loadouts (champion_id, items_key, count):")
+    for r in cur.fetchall():
+        print(r)
 
     conn.close()
 
