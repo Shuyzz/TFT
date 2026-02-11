@@ -7,7 +7,7 @@ DB_PATH = "data/tft.db"
 RAW_DIR = "data/raw_matches"
 
 # Set True if you want to rebuild from scratch each time
-WIPE_DB = False
+WIPE_DB = True
 
 def create_tables(conn: sqlite3.Connection):
     cur = conn.cursor()
